@@ -1,6 +1,14 @@
 import { State } from "..";
 
+import {
+  ScreenShareQualityName,
+  ScreenShareQualityNames,
+} from "@revolt/rtc/screenShareQuality";
+
 import { AbstractStore } from ".";
+
+export type { ScreenShareQualityName };
+export { ScreenShareQualityNames };
 
 /**
  * Possible noise suppresion states. Browser is browser noise suppresion and enhanced is machine learning suppression via RNNoise.
@@ -11,20 +19,6 @@ const NoiseSuppresionStates: NoiseSuppresionState[] = [
   "disabled",
   "browser",
   "enhanced",
-];
-
-/**
- * Possible screen share qualities. Low is 720p@30fps, high 1080p@30fps and text is source@5fps.
- */
-export type ScreenShareQualityName = "low" | "high" | "text";
-
-/**
- * Array of available screen share quality names.
- */
-export const ScreenShareQualityNames: ScreenShareQualityName[] = [
-  "low",
-  "high",
-  "text",
 ];
 
 export interface TypeVoice {

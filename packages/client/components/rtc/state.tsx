@@ -17,10 +17,7 @@ import {
 import {
   LocalTrackPublication,
   Room,
-  ScreenShareCaptureOptions,
-  ScreenSharePresets,
   Track,
-  VideoEncoding,
   VideoPresets,
 } from "livekit-client";
 import { Channel } from "stoat.js";
@@ -39,6 +36,13 @@ import { VoiceCallCardContext } from "@revolt/ui/components/features/voice/callC
 import { Device, useDevice } from "@revolt/common";
 import { InRoom } from "./components/InRoom";
 import { RoomAudioManager } from "./components/RoomAudioManager";
+import {
+  captureChoiceForShareStart,
+  enabledScreenShareQualities,
+  resolveScreenShareCapture,
+  screenShareChoice,
+  type ScreenShareQualityChoice,
+} from "./screenShareQuality";
 import { VoiceProcessor } from "./VoiceProcessor";
 
 type State =
@@ -50,13 +54,7 @@ type State =
 
 export type VoiceLayout = "fullscreen" | "expanded" | "collapsed" | undefined;
 
-type ScreenShareQuality = Required<
-  Pick<ScreenShareCaptureOptions, "contentHint" | "resolution">
-> & {
-  name: ScreenShareQualityName;
-  fullName: string;
-  encoding: VideoEncoding;
-};
+type ScreenShareQuality = ScreenShareQualityChoice;
 
 class Voice {
   #settings: VoiceSettings;
@@ -229,7 +227,10 @@ class Voice {
       },
       publishDefaults: {
         videoEncoding: VideoPresets.h720.encoding,
-        screenShareEncoding: ScreenSharePresets.h720fps30.encoding,
+        screenShareEncoding: screenShareChoice(
+          this.#settings.screenShareQuality,
+          this.limits().video_resolution,
+        ).encoding,
       },
     });
 
@@ -426,56 +427,7 @@ class Voice {
   getEnabledScreenShareQualities(): Partial<
     Record<ScreenShareQualityName, ScreenShareQuality>
   > {
-    // Always enable low
-    const qualities: Partial<
-      Record<ScreenShareQualityName, ScreenShareQuality>
-    > = {
-      low: {
-        name: "low",
-        resolution: ScreenSharePresets.h720fps30.resolution,
-        fullName: `720p 30FPS`,
-        contentHint: "motion",
-        encoding: ScreenSharePresets.h720fps30.encoding,
-      },
-    };
-
-    const limit = this.limits().video_resolution;
-
-    // TODO: Add more resolutions to stream from if they're enabled. May tie into premium users in the future?
-    if (
-      (limit[0] === 0 || limit[0] >= 1920) &&
-      (limit[1] === 0 || limit[1] >= 1080)
-    ) {
-      qualities.high = {
-        name: "high",
-        resolution: ScreenSharePresets.h1080fps30.resolution,
-        fullName: `1080p 30FPS`,
-        contentHint: "motion",
-        encoding: ScreenSharePresets.h1080fps30.encoding,
-      };
-      const originalResolution = ScreenSharePresets.original.resolution;
-      originalResolution.frameRate = 5;
-      originalResolution.aspectRatio = 0;
-
-      const limit = this.limits().video_resolution;
-      originalResolution.width = limit[0];
-      originalResolution.height = limit[1];
-      // If both resolutions are limited, set aspect ratio
-      if (originalResolution.height !== 0 && originalResolution.width !== 0) {
-        originalResolution.aspectRatio =
-          originalResolution.width / originalResolution.height;
-      }
-
-      qualities.text = {
-        name: "text",
-        resolution: originalResolution,
-        fullName: `Source 5FPS`,
-        contentHint: "text",
-        encoding: ScreenSharePresets.original.encoding,
-      };
-    }
-
-    return qualities;
+    return enabledScreenShareQualities(this.limits().video_resolution);
   }
 
   async toggleScreenshare() {
@@ -520,14 +472,20 @@ class Voice {
       }
 
       try {
-        const chosenQuality =
-          this.getEnabledScreenShareQualities()[
-            this.#settings.screenShareQuality || "low"
-          ];
+        const willChoose =
+          this.#settings.screenShareQualityAsk ||
+          !!window.native?.onceScreenPicker;
+        const chosenQuality = captureChoiceForShareStart(
+          this.limits().video_resolution,
+          this.#settings.screenShareQuality,
+          willChoose,
+        );
+        const capture = resolveScreenShareCapture(chosenQuality);
         const localTrack = await room.localParticipant.setScreenShareEnabled(
           true,
           {
-            resolution: chosenQuality?.resolution,
+            resolution: capture.resolution,
+            contentHint: capture.contentHint,
             audio: {
               autoGainControl: false,
               echoCancellation: false,
@@ -536,7 +494,7 @@ class Voice {
               restrictOwnAudio: true,
             },
           },
-          { screenShareEncoding: chosenQuality?.encoding },
+          { screenShareEncoding: capture.encoding },
         );
 
         const screenAudioTrack = room.localParticipant.getTrackPublication(
@@ -564,67 +522,108 @@ class Voice {
             audio: boolean,
           ) => {
             const quality = qualities[qualityName] || qualities.low!;
+            const videoTrack = localTrack.videoTrack;
+            if (!videoTrack) return;
 
-            if (localTrack.videoTrack) {
-              await localTrack.videoTrack.applyScreenShareConstraints(
+            const settings = videoTrack.mediaStreamTrack.getSettings();
+            const fitted = resolveScreenShareCapture(
+              quality,
+              settings.width && settings.height
+                ? { width: settings.width, height: settings.height }
+                : undefined,
+              this.limits().video_resolution,
+            );
+
+            const adjustable = videoTrack as typeof videoTrack & {
+              applyScreenShareConstraints?: (
+                options: {
+                  resolution: {
+                    frameRate: number;
+                    width: number;
+                    height: number;
+                  };
+                  contentHint: ScreenShareQuality["contentHint"];
+                },
+                encoding: ScreenShareQuality["encoding"],
+              ) => Promise<void>;
+            };
+
+            if (adjustable.applyScreenShareConstraints) {
+              await adjustable.applyScreenShareConstraints(
                 {
                   resolution: {
-                    frameRate: quality.resolution.frameRate,
-                    width: quality.resolution.width,
-                    height: quality.resolution.height,
+                    frameRate: fitted.resolution.frameRate,
+                    width: fitted.resolution.width,
+                    height: fitted.resolution.height,
                   },
-                  contentHint: quality.contentHint,
+                  contentHint: fitted.contentHint,
                 },
-                quality.encoding,
+                fitted.encoding,
               );
-              if (!audio && screenAudioTrack?.track) {
-                room.localParticipant.unpublishTrack(screenAudioTrack.track);
+            } else if (fitted.resolution.width > 0 && fitted.resolution.height > 0) {
+              await videoTrack.restartTrack({
+                resolution: fitted.resolution,
+              });
+              const sender = videoTrack.sender;
+              if (sender) {
+                const params = sender.getParameters();
+                for (const encoding of params.encodings ?? []) {
+                  encoding.maxFramerate = fitted.encoding.maxFramerate;
+                  encoding.maxBitrate = fitted.encoding.maxBitrate;
+                }
+                await sender.setParameters(params);
               }
-              this.sound.playSound("streamStart");
             }
+
+            videoTrack.mediaStreamTrack.contentHint = fitted.contentHint;
+            if (!audio && screenAudioTrack?.track) {
+              room.localParticipant.unpublishTrack(screenAudioTrack.track);
+            }
+            this.sound.playSound("streamStart");
           };
 
           if (screenPickerQualityName) {
-            callback(
+            await callback(
               screenPickerQualityName || "low",
               screenPickerAudio || false,
             );
-          } else if (this.#settings.screenShareQualityAsk) {
-            if (Object.keys(qualities).length > 1) {
-              localTrack.pauseUpstream();
-              screenAudioTrack?.pauseUpstream();
-              this.openModal({
-                onCancel: async () => {
-                  await room.localParticipant.setScreenShareEnabled(false);
-                  this.#setScreenshare(
-                    room.localParticipant.isScreenShareEnabled,
-                  );
-                },
-                type: "screen_share_settings",
-                trackReference: {
-                  participant: room.localParticipant,
-                  publication: localTrack,
-                  source: Track.Source.ScreenShare,
-                },
-                qualities: Object.keys(qualities).map((k) => {
-                  const v = qualities[k as ScreenShareQualityName]!;
-                  return { name: k, fullName: v.fullName };
-                }),
-                audio: !!screenAudioTrack,
-                callback: async (qualityName, audio) => {
-                  callback(qualityName, audio);
-                  localTrack.resumeUpstream();
-                  if (audio) {
-                    screenAudioTrack?.resumeUpstream();
-                  }
-                },
-              });
-            } else {
-              callback(
-                this.#settings.screenShareQuality || "low",
-                this.#settings.screenShareAudio,
-              );
-            }
+          } else if (
+            this.#settings.screenShareQualityAsk &&
+            Object.keys(qualities).length > 1
+          ) {
+            localTrack.pauseUpstream();
+            screenAudioTrack?.pauseUpstream();
+            this.openModal({
+              onCancel: async () => {
+                await room.localParticipant.setScreenShareEnabled(false);
+                this.#setScreenshare(
+                  room.localParticipant.isScreenShareEnabled,
+                );
+              },
+              type: "screen_share_settings",
+              trackReference: {
+                participant: room.localParticipant,
+                publication: localTrack,
+                source: Track.Source.ScreenShare,
+              },
+              qualities: Object.keys(qualities).map((k) => {
+                const v = qualities[k as ScreenShareQualityName]!;
+                return { name: k, fullName: v.fullName };
+              }),
+              audio: !!screenAudioTrack,
+              callback: async (qualityName, audio) => {
+                await callback(qualityName, audio);
+                localTrack.resumeUpstream();
+                if (audio) {
+                  screenAudioTrack?.resumeUpstream();
+                }
+              },
+            });
+          } else {
+            await callback(
+              this.#settings.screenShareQuality || "low",
+              this.#settings.screenShareAudio,
+            );
           }
         }
       } catch (e) {

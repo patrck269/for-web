@@ -1,3 +1,4 @@
+import { displayMediaVideoConstraints } from "./screenShareQuality";
 import { getVirtmic } from "./virtualMic";
 
 export { useVoice, VoiceContext } from "./state";
@@ -9,15 +10,10 @@ export { stoatSinkName } from "./virtualMic";
 const originalMediaCall = navigator.mediaDevices.getDisplayMedia;
 
 navigator.mediaDevices.getDisplayMedia = async function (opts) {
-  // Hard overwrite the track constraints so that we -never ever- get a track
-  // that is over 720p when requesting a new video track
+  // Keep the size and frame rate the quality resolver asked for, as a max box
+  // so an ultrawide source is not cropped to 16:9.
   if (opts && opts.video && typeof opts.video === "object") {
-    opts.video = {
-      ...opts.video,
-      frameRate: { ideal: 5, max: 5 },
-      width: { ideal: 640, max: 640 },
-      height: { ideal: 480, max: 480 },
-    };
+    opts.video = displayMediaVideoConstraints(opts.video);
   }
 
   const stream: MediaStream = await originalMediaCall.call(this, opts);
